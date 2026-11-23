@@ -69,5 +69,12 @@ node "$S" restore --from "$BK" --home "$H" >/dev/null || bad "restore 执行失�
 node -e 'const j=require(process.argv[1]);process.exit(j.mcpServers?0:1)' "$H/.claude.json" && ok "restore 未覆盖已存在文件(默认)" || bad "restore 覆盖"
 node "$S" restore --from "$BK" --home "$H" --force >/dev/null && node -e 'const j=require(process.argv[1]);process.exit(j.userID==="u"?0:1)' "$H/.claude.json" && ok "restore --force 还原原 .claude.json" || bad "restore --force"
 
+# 安装器适配层（使用独立的假 HOME / 项目目录）
+IH="$H/inst-home"; IP="$H/inst-project"; IDIR="$(dirname "$S")"
+node "$IDIR/install.cjs" --list | grep -q 'claude-code' && ok "installer: 列表" || bad "installer: 列表"
+node "$IDIR/install.cjs" --home "$IH" --agent claude-code >/dev/null && [ -L "$IH/.claude/skills/claude-env-cleanup" ] && ok "installer: 用户级 symlink" || bad "installer: 用户级 symlink"
+node "$IDIR/install.cjs" --project "$IP" --agent codex --copy >/dev/null && [ -f "$IP/.agents/skills/claude-env-cleanup/SKILL.md" ] && ok "installer: 项目级 copy" || bad "installer: 项目级 copy"
+node "$IDIR/install.cjs" --home "$IH" --agent claude-code | grep -q "已存在" && ok "installer: 幂等" || bad "installer: 幂等"
+
 rm -rf "$H"
 [ $fail = 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }

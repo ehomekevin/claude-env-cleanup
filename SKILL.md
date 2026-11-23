@@ -8,11 +8,14 @@ description: >-
   本地时区语言与 IP 对齐度，并给出新开 Claude 前的前置调整建议（经用户认可后可代为配置）。
   当用户说"清理 Claude 环境 / 清理封号痕迹 / 重置 Claude 本地状态 / 检查 Claude 残留 / ban log / 换设备前清干净 / 检测 IP 质量"时使用。
   提炼自 NeverBanned 的 detectClaudeLocalResidue 与 resetClaudeLocalState。
+license: MIT
+compatibility: macOS 13+ / Windows 10+; Node.js 18+; read-only scan by default
 ---
 
 # Claude 本地环境清理
 
 脚本：`scripts/claude_env_cleanup.cjs`（Node 18+，零依赖，支持 macOS 与 Windows）。
+安装到 Claude Code / Codex / Cursor / Gemini CLI 等见 [README 的「安装到主流 Agent」](README.md#安装到主流-agent)。
 
 - macOS Desktop 数据目录：`~/Library/Application Support/Claude/`
 - Windows Desktop 数据目录：`%APPDATA%\Claude`（即 `~/AppData/Roaming/Claude`）

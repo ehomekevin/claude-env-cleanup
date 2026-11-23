@@ -83,18 +83,43 @@ node scripts/claude_env_cleanup.cjs restore --from ~/.claude-env-cleanup-backups
 | netcheck 出口 | 自动走系统代理（`scutil --proxy`） | 走环境变量代理 |
 | Keychain / defaults | ✓ | 自动跳过（无对应机制） |
 
-## 作为 Agent Skill 安装
+## 安装到主流 Agent
 
-把整个文件夹放到对应位置即可：
+本仓库遵循 [Agent Skills](https://agentskills.io/specification) 开放规范（`SKILL.md` + 可选 `scripts/`），Claude Code、Codex、Cursor、Gemini CLI 等都能直接识别。安装方式二选一：
 
-| Agent | 位置 |
-| :--- | :--- |
-| Claude Code | `~/.claude/skills/claude-env-cleanup/` |
-| WorkBuddy | `~/.workbuddy/skills/claude-env-cleanup/` |
-| Antigravity（全局） | `~/.gemini/config/skills/claude-env-cleanup/` |
-| Antigravity（单项目） | `<项目>/.agents/skills/claude-env-cleanup/` |
+```bash
+# 方式 A：社区标准 CLI（Node 22.20+，自动识别已安装的 Agent）
+npx skills add ehomekevin/claude-env-cleanup -a claude-code
 
-之后对 agent 说“帮我检查一下 Claude 本地残留”或“清理 Claude 环境”即可。SKILL.md 会约束 agent：先扫描，讲清后果并取得你确认，问清备份方式，才会清理。
+# 方式 B：本仓零依赖安装脚本（Node 18+，macOS / Linux / Windows）
+node scripts/install.cjs --list                      # 查看各 Agent 的安装路径
+node scripts/install.cjs --agent claude-code         # 装到用户级目录
+node scripts/install.cjs --agent codex,cursor,gemini-cli
+node scripts/install.cjs --agent codex --project .   # 装到当前项目的 .agents/skills
+node scripts/install.cjs --agent claude-code --copy  # 复制而非符号链接（Windows 无权限时自动回退）
+```
+
+默认用**符号链接**，`git pull` 后立即生效；`--copy` 是复制一份，更新时需要重跑脚本。目标已存在且不是本 skill 的链接时会拒绝，加 `--force` 会先备份再替换。
+
+| Agent | `--agent` | 全局路径 | 项目路径 |
+| :--- | :--- | :--- | :--- |
+| Claude Code | `claude-code` | `~/.claude/skills/` | `.claude/skills/` |
+| Codex CLI | `codex` | `~/.agents/skills/` | `.agents/skills/` |
+| Cursor | `cursor` | `~/.cursor/skills/` | `.agents/skills/` |
+| Gemini CLI | `gemini-cli` | `~/.gemini/skills/` | `.agents/skills/` |
+| GitHub Copilot | `github-copilot` | `~/.copilot/skills/` | `.agents/skills/` |
+| OpenCode | `opencode` | `~/.config/opencode/skills/` | `.agents/skills/` |
+| Antigravity | `antigravity` | `~/.gemini/config/skills/` | `.agents/skills/` |
+| Windsurf | `windsurf` | `~/.codeium/windsurf/skills/` | `.windsurf/skills/` |
+| Cline | `cline` | `~/.agents/skills/` | `.agents/skills/` |
+| Continue | `continue` | `~/.continue/skills/` | `.continue/skills/` |
+| Roo Code | `roo` | `~/.roo/skills/` | `.roo/skills/` |
+| Qwen Code | `qwen-code` | `~/.qwen/skills/` | `.qwen/skills/` |
+| Amp | `amp` | `~/.config/agents/skills/` | `.agents/skills/` |
+| WorkBuddy | `workbuddy` | `~/.workbuddy/skills/` | `.workbuddy/skills/` |
+| 通用 `.agents`（DSH 等） | `agents` / `dsh` | `~/.agents/skills/` | `.agents/skills/` |
+
+> 路径按 2026-11 的 Agent Skills 规范与社区 [agent→path 表](https://github.com/vercel-labs/skills/blob/main/docs/agents.md)整理；Codex / Cursor / Gemini CLI / Copilot / OpenCode / Amp / Cline 等项目级目录共用 `.agents/skills`。安装后对 Agent 说“帮我检查一下 Claude 本地残留”或“清理 Claude 环境”即可，SKILL.md 会约束它先扫描、讲清后果并取得确认，再问备份方式，最后才清理。
 
 ## 清理后会怎样
 
