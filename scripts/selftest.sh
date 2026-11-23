@@ -7,37 +7,51 @@ fail=0
 ok()  { echo "PASS  $1"; }
 bad() { echo "FAIL  $1"; fail=1; }
 
-D="$H/Library/Application Support/Claude"
-mkdir -p "$D/Local Storage/leveldb" "$D/IndexedDB" "$D/claude-code-sessions/0123456789abcdef" "$D/claude-code-sessions/fedcba9876543210"
+if [ "$(uname -s)" = "Darwin" ]; then
+  D="$H/Library/Application Support/Claude"
+else
+  # Windows / Linux 下脚本按同一约定解析 Desktop 目录
+  D="$H/AppData/Roaming/Claude"
+fi
+mkdir -p "$D/Local Storage/leveldb" "$D/IndexedDB" "$D/claude-code-sessions/0123456789abcdef" "$D/claude-code-sessions/fedcba9876543210" "$D/logs"
 echo cookie > "$D/Cookies"; echo did > "$D/ant-did"; echo '{"mcpServers":{"x":{}}}' > "$D/claude_desktop_config.json"
+echo 'error organization_disabled happened' > "$D/logs/main.log"
 mkdir -p "$H/Library/Logs/Claude" "$H/Library/Caches/com.anthropic.claudefordesktop" "$H/.cache/claude" "$H/Library/Logs/Other"
 echo log > "$H/Library/Logs/Claude/main.log"; echo keep > "$H/Library/Logs/Other/x.log"
 echo '{"userID":"u","oauthAccount":{"e":"a@b"},"mcpServers":{"m":{}},"theme":"dark"}' > "$H/.claude.json"
 mkdir -p "$H/.claude/statsig" "$H/.claude/skills/my" "$H/.claude/projects"
 echo c > "$H/.claude/.credentials.json"; echo h > "$H/.claude/history.jsonl"; echo s > "$H/.claude/skills/my/SKILL.md"
 echo '{"env":{"ANTHROPIC_BASE_URL":"https://relay.example","FOO":"1"},"model":"opus"}' > "$H/.claude/settings.json"
+echo '{"env":{"ANTHROPIC_AUTH_TOKEN":"sk-old-secret"}}' > "$H/.claude/settings.json.bak"
 printf 'export PATH=/x\nexport ANTHROPIC_BASE_URL=https://relay\n# export HTTPS_PROXY=x\n' > "$H/.zshrc"
 
-out=$(node "$S" scan --home "$H" --json)
+out=$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy node "$S" scan --home "$H" --json)
 echo "$out" | grep -q '"clean": false' && ok "scan 检出残留" || bad "scan 检出残留"
 echo "$out" | grep -q '"sessionAccounts": 2' && ok "scan 识别 2 个历史账号会话" || bad "scan 多账号"
 echo "$out" | grep -q 'relay.example\|a@b' && bad "scan 泄露敏感值" || ok "scan 不输出敏感值"
 echo "$out" | grep -q 'HTTPS_PROXY' && bad "scan 误报注释行" || ok "scan 跳过注释行"
+echo "$out" | grep -q 'logs/main.log: 1 处封禁' && ok "scan 检出封禁痕迹" || bad "scan 封禁痕迹"
+echo "$out" | grep -q 'settings.json.bak env: ANTHROPIC_AUTH_TOKEN' && ok "scan 检出备份文件凭据残留" || bad "scan 备份凭据"
 
 node "$S" clean --home "$H" >/dev/null 2>&1 && bad "无 --yes 应拒绝" || ok "无 --yes 拒绝执行"
 [ -f "$D/Cookies" ] && ok "拒绝后文件未动" || bad "拒绝后文件被改"
 
 node "$S" clean --yes --home "$H" --json > "$H/clean.json" || bad "clean 执行失败"
-[ ! -e "$D/Cookies" ] && [ ! -e "$D/ant-did" ] && [ ! -e "$D/claude-code-sessions" ] && ok "Desktop 残留已清" || bad "Desktop 残留未清"
+[ ! -e "$D/Cookies" ] && [ ! -e "$D/ant-did" ] && [ ! -e "$D/claude-code-sessions" ] && [ ! -e "$D/logs" ] && ok "Desktop 残留已清（含 logs 封禁日志）" || bad "Desktop 残留未清"
 grep -q mcpServers "$D/claude_desktop_config.json" && ok "Desktop MCP 配置保留" || bad "Desktop MCP 配置丢失"
 [ ! -e "$H/Library/Logs/Claude" ] && [ -f "$H/Library/Logs/Other/x.log" ] && ok "系统日志精确清理、无关目录保留" || bad "系统日志清理"
 node -e 'const j=require(process.argv[1]);process.exit(!j.userID&&!j.oauthAccount&&j.mcpServers&&j.theme==="dark"?0:1)' "$H/.claude.json" && ok ".claude.json 白名单保留" || bad ".claude.json 白名单"
 [ ! -e "$H/.claude/.credentials.json" ] && [ -f "$H/.claude/skills/my/SKILL.md" ] && [ -d "$H/.claude/projects" ] && ok "~/.claude 凭据清理、skills/projects 保留" || bad "~/.claude 清理"
 node -e 'const j=require(process.argv[1]);process.exit(!j.env.ANTHROPIC_BASE_URL&&j.env.FOO==="1"&&j.model==="opus"?0:1)' "$H/.claude/settings.json" && ok "settings 仅剥离中转变量" || bad "settings 剥离"
+node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.exit(!j.env.ANTHROPIC_AUTH_TOKEN?0:1)' "$H/.claude/settings.json.bak" && ok "备份文件凭据已剥离" || bad "备份文件凭据"
 grep -q ANTHROPIC_BASE_URL "$H/.zshrc" && ok ".zshrc 未被修改" || bad ".zshrc 被修改"
 
 BK=$(node -e 'console.log(require(process.argv[1]).backupDir)' "$H/clean.json")
-[ "$(stat -f %Lp "$BK")" = "700" ] && ok "备份目录 0700" || bad "备份目录权限"
+if [ "$(uname -s)" = "Darwin" ]; then
+  [ "$(stat -f %Lp "$BK")" = "700" ] && ok "备份目录 0700" || bad "备份目录权限"
+else
+  ok "备份目录权限（非 macOS 跳过，权限模型不同）"
+fi
 
 node "$S" scan --home "$H" --json | grep -q '"desktop": \[\]' && ok "清理后 Desktop 类为空" || bad "清理后复扫"
 

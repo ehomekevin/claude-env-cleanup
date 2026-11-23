@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * claude-env-cleanup — Claude Desktop / Claude Code 本地环境残留扫描与清理（macOS）
+ * claude-env-cleanup — Claude Desktop / Claude Code 本地环境残留扫描与清理（macOS / Windows）
  *
  * 提炼自 NeverBanned 的 detectClaudeLocalResidue / resetClaudeLocalState，独立运行，零依赖。
  *
@@ -38,6 +38,8 @@ const DESKTOP_RESET_TARGETS = [
   "declarative_performance_observer.db", "declarative_performance_observer.db-journal", "claude-code-sessions",
   "local-agent-mode-sessions", "side-session-notes", "spaces-present", "cowork-memory-resets.json",
   "cowork-enabled-cli-ops.json", "remote-file-download-parts.json",
+  // Desktop 日志：本机封禁/禁用记录（organization_disabled 等）的主要藏身处
+  "logs",
 ];
 const DESKTOP_KEY_LABELS = {
   "ant-did": "ant-did（设备指纹）",
@@ -46,6 +48,7 @@ const DESKTOP_KEY_LABELS = {
   fcache: "fcache（策略缓存）",
   "claude-code-sessions": "claude-code-sessions（历史账号会话）",
   "local-agent-mode-sessions": "local-agent-mode-sessions（历史账号会话）",
+  logs: "logs（Desktop 日志，含封禁/禁用痕迹）",
 };
 const DESKTOP_PRESERVE = "claude_desktop_config.json";
 
@@ -98,11 +101,17 @@ function parseArgs(argv) {
 
 function resolvePaths(homeOverride) {
   const home = path.resolve(homeOverride || os.homedir());
-  const isRealHome = home === path.resolve(os.homedir()) && process.platform === "darwin";
+  const platform = process.platform;
+  const isRealHome = home === path.resolve(os.homedir());
+  const desktopDir =
+    platform === "darwin"
+      ? path.join(home, "Library", "Application Support", "Claude")
+      : path.join(home, "AppData", "Roaming", "Claude"); // Windows（测试假 HOME 亦沿用同一约定）
   return {
     home,
+    platform,
     isRealHome,
-    desktopDir: path.join(home, "Library", "Application Support", "Claude"),
+    desktopDir,
     claudeJson: path.join(home, ".claude.json"),
     dotClaude: path.join(home, ".claude"),
     backupRoot: path.join(home, ".claude-env-cleanup-backups"),
@@ -136,6 +145,38 @@ function listSystemCacheHits(home) {
   return hits;
 }
 
+// ~/.claude 下所有 settings*.json*（含 settings.json.bak 等备份残留）
+function settingsCandidateFiles(dotClaude) {
+  const names = [];
+  try {
+    for (const n of fs.readdirSync(dotClaude)) {
+      if (/^settings.*\.json/i.test(n)) names.push(n);
+    }
+  } catch (_) {}
+  return names;
+}
+
+// 只读检测 Desktop 日志里的封禁/禁用痕迹（绝不输出 Cookie/凭据内容，只统计命中数）
+const BAN_TRACE_RE = /organization_disabled|organization has been disabled|account (?:has been )?(?:banned|deactivated|suspended)|banned for|device (?:is )?banned/i;
+function detectBanTraces(desktopDir) {
+  const logsDir = path.join(desktopDir, "logs");
+  const hits = [];
+  if (!isRealDir(logsDir)) return hits;
+  let names = [];
+  try { names = fs.readdirSync(logsDir); } catch (_) { return hits; }
+  for (const n of names) {
+    const f = path.join(logsDir, n);
+    let st;
+    try { st = fs.statSync(f); } catch (_) { continue; }
+    if (!st.isFile() || st.size > 64 * 1024 * 1024) continue;
+    let content = "";
+    try { content = fs.readFileSync(f, "utf8"); } catch (_) { continue; }
+    const count = (content.match(BAN_TRACE_RE) || []).length;
+    if (count) hits.push(`logs/${n}: ${count} 处封禁/禁用记录`);
+  }
+  return hits;
+}
+
 function countSessionAccounts(desktopDir) {
   const seen = new Set();
   for (const sub of ["local-agent-mode-sessions", "claude-code-sessions"]) {
@@ -151,7 +192,7 @@ function countSessionAccounts(desktopDir) {
 }
 
 function keychainExists(service, isRealHome) {
-  if (!isRealHome) return false;
+  if (!isRealHome || process.platform !== "darwin") return false;
   try {
     // -s 不带 -w：只判断是否存在，绝不读取密码
     execFileSync("/usr/bin/security", ["find-generic-password", "-s", service], { stdio: "ignore", timeout: 1500 });
@@ -160,7 +201,7 @@ function keychainExists(service, isRealHome) {
 }
 
 function keychainDelete(service, isRealHome) {
-  if (!isRealHome) return false;
+  if (!isRealHome || process.platform !== "darwin") return false;
   try {
     execFileSync("/usr/bin/security", ["delete-generic-password", "-s", service], { stdio: "ignore", timeout: 2500 });
     return true;
@@ -168,15 +209,20 @@ function keychainDelete(service, isRealHome) {
 }
 
 function defaultsDelete(isRealHome) {
-  if (!isRealHome) return false;
+  if (!isRealHome || process.platform !== "darwin") return false;
   try {
     execFileSync("/usr/bin/defaults", ["delete", DEFAULTS_DOMAIN], { stdio: "ignore", timeout: 2000 });
     return true;
   } catch (_) { return false; }
 }
 
-function runningClaude() {
-  if (process.platform !== "darwin") return [];
+function runningClaude(platform) {
+  if (platform === "darwin") return runningClaudeDarwin();
+  if (platform === "win32") return runningClaudeWindows();
+  return [];
+}
+
+function runningClaudeDarwin() {
   let out = "";
   try { out = execFileSync("/bin/ps", ["-axo", "pid=,args="], { encoding: "utf8", timeout: 3000 }); } catch (_) { return []; }
   const hits = [];
@@ -187,6 +233,26 @@ function runningClaude() {
     if (/\/Claude\.app\/Contents\/MacOS\/Claude(\s|$)/.test(cmd)) hits.push({ pid: Number(m[1]), kind: "Claude Desktop" });
     else if (/(^|\/)claude(\s|$)/.test(cmd.split(" ")[0]) || /@anthropic-ai\/claude-code/.test(cmd) || /\/\.local\/share\/claude\/versions\//.test(cmd)) {
       if (!/claude_env_cleanup/.test(cmd)) hits.push({ pid: Number(m[1]), kind: "Claude Code CLI" });
+    }
+  }
+  return hits;
+}
+
+function runningClaudeWindows() {
+  let out = "";
+  try {
+    out = execFileSync("tasklist", ["/FO", "CSV", "/NH"], { encoding: "utf8", timeout: 5000 });
+  } catch (_) { return []; }
+  const hits = [];
+  let nextPid = 1;
+  for (const line of out.split("\n")) {
+    const cols = line.match(/"([^"]*)"/g);
+    if (!cols || cols.length < 2) continue;
+    const image = cols[0].slice(1, -1).toLowerCase();
+    const pid = Number(cols[1].slice(1, -1)) || nextPid++;
+    if (/^claude(\.exe)?$/i.test(image)) hits.push({ pid, kind: "Claude Desktop" });
+    else if (/^claude-code(\.exe)?$/i.test(image) || /@anthropic-ai[\\/]claude-code/.test(line)) {
+      hits.push({ pid, kind: "Claude Code CLI" });
     }
   }
   return hits;
@@ -218,6 +284,7 @@ function scan(P) {
   const cli = [];
   const keychain = [];
   const relay = [];
+  const banTrace = [];
   const notes = [];
 
   if (isRealDir(P.desktopDir)) {
@@ -245,7 +312,9 @@ function scan(P) {
 
   if (keychainExists(KEYCHAIN_CLI, P.isRealHome)) keychain.push(`Keychain: ${KEYCHAIN_CLI}`);
   if (keychainExists(KEYCHAIN_DESKTOP, P.isRealHome)) keychain.push(`Keychain: ${KEYCHAIN_DESKTOP}`);
-  if (!P.isRealHome) notes.push("非真实 HOME 或非 macOS：已跳过 Keychain 与 defaults 检查");
+  if (!P.isRealHome || P.platform !== "darwin") notes.push("非真实 HOME 或非 macOS：已跳过 Keychain 与 defaults 检查");
+
+  banTrace.push(...detectBanTraces(P.desktopDir));
 
   const relayRe = /^\s*(export\s+)?(ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY)|HTTPS?_PROXY|ALL_PROXY|https?_proxy|all_proxy)\s*=/;
   const rcHits = [];
@@ -263,11 +332,14 @@ function scan(P) {
     } catch (_) {}
   }
   for (const h of rcHits) relay.push(`${h.file}: ${h.vars.join(", ")}（仅报告，需手动处理）`);
-  for (const s of ["settings.json", "settings.local.json"]) {
+  for (const s of settingsCandidateFiles(P.dotClaude)) {
     const j = readJsonSafe(path.join(P.dotClaude, s));
     if (j && j.env && typeof j.env === "object") {
       const keys = RELAY_ENV_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(j.env, k));
-      if (keys.length) relay.push(`~/.claude/${s} env: ${keys.join(", ")}`);
+      if (keys.length) {
+        const tag = /\.bak$/i.test(s) || /settings\.json\.\d+/.test(s) ? "（备份文件凭据残留）" : "";
+        relay.push(`~/.claude/${s} env: ${keys.join(", ")}${tag}`);
+      }
     }
   }
 
@@ -275,15 +347,15 @@ function scan(P) {
     .filter((k) => process.env[k]);
   if (envProxy.length) relay.push(`当前进程环境变量: ${envProxy.join(", ")}（值已隐藏）`);
 
-  const total = desktop.length + sys.length + cli.length + keychain.length + relay.length;
+  const total = desktop.length + sys.length + cli.length + keychain.length + relay.length + banTrace.length;
   return {
     home: P.home,
     clean: total === 0,
     count: total,
-    categories: { desktop, systemCache: sys, cli, keychain, relay },
+    categories: { desktop, systemCache: sys, cli, keychain, relay, banTrace },
     sessionAccounts,
     notes,
-    running: P.isRealHome ? runningClaude() : [],
+    running: P.isRealHome ? runningClaude(P.platform) : [],
   };
 }
 
@@ -293,7 +365,7 @@ function clean(P, flags) {
   if (!flags.has("--yes")) {
     throw new Error("clean 会删除本地登录态与设备标识，必须显式加 --yes 二次确认");
   }
-  const live = P.isRealHome ? runningClaude() : [];
+  const live = P.isRealHome ? runningClaude(P.platform) : [];
   if (live.length) {
     throw new Error(`Claude 仍在运行（${live.map((x) => `${x.kind} PID ${x.pid}`).join("，")}），请先完全退出再清理，否则退出时会回写旧 Cookie/设备 ID`);
   }
@@ -366,7 +438,7 @@ function clean(P, flags) {
       result.dotClaude.push(t);
     }
     if (!flags.has("--keep-relay")) {
-      for (const s of ["settings.json", "settings.local.json"]) {
+      for (const s of settingsCandidateFiles(P.dotClaude)) {
         const sp = path.join(P.dotClaude, s);
         const j = readJsonSafe(sp);
         if (!j || !j.env || typeof j.env !== "object") continue;
@@ -439,10 +511,11 @@ function printScan(r) {
   L.push(r.clean ? "结果：未发现残留 ✓" : `结果：发现 ${r.count} 项残留`);
   const sec = (title, arr) => { if (arr.length) { L.push(`\n[${title}]`); for (const x of arr) L.push(`  - ${x}`); } };
   sec("Claude Desktop 存储与设备 ID", r.categories.desktop);
-  sec("macOS 系统日志 / 缓存", r.categories.systemCache);
+  sec("系统日志 / 缓存", r.categories.systemCache);
   sec("Claude Code CLI 身份 / 会话", r.categories.cli);
   sec("Keychain（仅检测存在，未读取）", r.categories.keychain);
   sec("中转 / 代理配置", r.categories.relay);
+  sec("封禁痕迹（只读检测，清理 logs 即移除）", r.categories.banTrace);
   if (r.notes.length) sec("提示", r.notes);
   if (r.running.length) sec("正在运行（清理前需退出）", r.running.map((x) => `${x.kind} PID ${x.pid}`));
   console.log(L.join("\n"));
@@ -453,7 +526,7 @@ function printClean(r) {
   L.push("清理完成");
   L.push(`备份目录: ${r.backupDir}`);
   L.push(`Claude Desktop: 清理 ${r.desktop.length} 项${r.preservedDesktopMcpConfig ? "（MCP 配置已保留）" : ""}`);
-  L.push(`macOS 系统缓存: 清理 ${r.systemCache.length} 项；defaults 偏好: ${r.defaultsDeleted ? "已删除" : "未删除/不存在"}`);
+  L.push(`系统缓存/日志: 清理 ${r.systemCache.length} 项；defaults 偏好: ${r.defaultsDeleted ? "已删除" : "未删除/不存在"}`);
   L.push(`~/.claude.json: 移除 ${r.claudeJsonRemovedKeys.length} 个跟踪字段（mcpServers 与界面偏好已保留）`);
   L.push(`~/.claude: 清理 ${r.dotClaude.length} 项`);
   if (r.relaySettings.length) L.push(`settings 中转变量: ${r.relaySettings.map((x) => `${x.file}(${x.removedKeys.join(",")})`).join("；")}`);
