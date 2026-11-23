@@ -88,8 +88,8 @@ node scripts/claude_env_cleanup.cjs restore --from ~/.claude-env-cleanup-backups
 本仓库遵循 [Agent Skills](https://agentskills.io/specification) 开放规范（`SKILL.md` + 可选 `scripts/`），Claude Code、Codex、Cursor、Gemini CLI 等都能直接识别。安装方式二选一：
 
 ```bash
-# 方式 A：社区标准 CLI（Node 22.20+，自动识别已安装的 Agent）
-npx skills add ehomekevin/claude-env-cleanup -a claude-code
+# 方式 A：社区标准 CLI（Node 22.20+，自动识别已安装的 Agent；-g 全局，-y 跳过确认）
+npx skills add ehomekevin/claude-env-cleanup --skill claude-env-cleanup -a claude-code -g
 
 # 方式 B：本仓零依赖安装脚本（Node 18+，macOS / Linux / Windows）
 node scripts/install.cjs --list                      # 查看各 Agent 的安装路径
