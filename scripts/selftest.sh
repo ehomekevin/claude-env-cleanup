@@ -17,7 +17,7 @@ mkdir -p "$D/Local Storage/leveldb" "$D/IndexedDB" "$D/claude-code-sessions/0123
 echo cookie > "$D/Cookies"; echo did > "$D/ant-did"; echo '{"mcpServers":{"x":{}}}' > "$D/claude_desktop_config.json"
 echo 'error organization_disabled happened' > "$D/logs/main.log"
 mkdir -p "$H/Library/Logs/Claude" "$H/Library/Caches/com.anthropic.claudefordesktop" "$H/.cache/claude" "$H/Library/Logs/Other"
-echo log > "$H/Library/Logs/Claude/main.log"; echo keep > "$H/Library/Logs/Other/x.log"
+echo 'error account_banned' > "$H/Library/Logs/Claude/main.log"; echo keep > "$H/Library/Logs/Other/x.log"
 echo '{"userID":"u","oauthAccount":{"e":"a@b"},"mcpServers":{"m":{}},"theme":"dark"}' > "$H/.claude.json"
 mkdir -p "$H/.claude/statsig" "$H/.claude/skills/my" "$H/.claude/projects"
 echo c > "$H/.claude/.credentials.json"; echo h > "$H/.claude/history.jsonl"; echo s > "$H/.claude/skills/my/SKILL.md"
@@ -31,6 +31,15 @@ echo "$out" | grep -q '"sessionAccounts": 2' && ok "scan 识别 2 个历史账�
 echo "$out" | grep -q 'relay.example\|a@b' && bad "scan 泄露敏感值" || ok "scan 不输出敏感值"
 echo "$out" | grep -q 'HTTPS_PROXY' && bad "scan 误报注释行" || ok "scan 跳过注释行"
 echo "$out" | grep -q 'logs/main.log: 1 处封禁' && ok "scan 检出封禁痕迹" || bad "scan 封禁痕迹"
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "$out" | grep -q 'Library/Logs/Claude/main.log: 1 处封禁' && ok "scan 检出 macOS 日志封禁痕迹" || bad "scan macOS 日志封禁痕迹"
+  node -e '
+    const m = require(process.argv[1]);
+    const p = m.parseScutilProxyOutput("<dictionary> {\n HTTPEnable : 1\n HTTPPort : 3208\n HTTPProxy : 127.0.0.1\n HTTPSEnable : 1\n HTTPSPort : 3208\n HTTPSProxy : 127.0.0.1\n}");
+    const dirs = m.banLogDirs({ desktopDir: "/x", home: "/h", platform: "darwin" }).map(d => d.dir);
+    process.exit(p.http && p.http.host === "127.0.0.1" && p.http.port === 3208 && dirs.includes("/h/Library/Logs/Claude") ? 0 : 1);
+  ' "$S" && ok "macOS 系统代理解析 + banLogDirs 路径" || bad "macOS 代理/日志路径"
+fi
 echo "$out" | grep -q 'settings.json.bak env: ANTHROPIC_AUTH_TOKEN' && ok "scan 检出备份文件凭据残留" || bad "scan 备份凭据"
 
 node "$S" clean --home "$H" >/dev/null 2>&1 && bad "无 --yes 应拒绝" || ok "无 --yes 拒绝执行"

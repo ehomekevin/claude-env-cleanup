@@ -52,6 +52,8 @@ node scripts/claude_env_cleanup.cjs netcheck
 
 输出包含逐条"前置调整建议"（换住宅 IP、关 IPv6、改系统时区/语言、禁用 WebRTC 等）。agent 按此流程使用时：先给建议清单，用户认可后才代为执行系统配置修改（需管理员权限的逐条确认）。
 
+macOS 下 `netcheck` 会自动读取系统代理（`scutil --proxy`，如 Clash / Verge 的本地端口）并通过 HTTP CONNECT 走**与 Claude 相同的出口**——Node 默认忽略系统代理，不处理会测到直连 IP、结论失真。加 `--no-proxy` 可强制直连，用于对比代理前后的出口差异；IPv6 与 STUN/UDP 检测始终直连（UDP 不走 HTTP 代理）。
+
 ## 快速开始
 
 ```bash
@@ -78,6 +80,7 @@ node scripts/claude_env_cleanup.cjs restore --from ~/.claude-env-cleanup-backups
 | 设备指纹 / Cookie / 会话清理 | ✓ | ✓ |
 | Desktop 日志清理（含封禁痕迹） | ✓ | ✓ |
 | 进程检测 | `ps` | `tasklist` |
+| netcheck 出口 | 自动走系统代理（`scutil --proxy`） | 走环境变量代理 |
 | Keychain / defaults | ✓ | 自动跳过（无对应机制） |
 
 ## 作为 Agent Skill 安装

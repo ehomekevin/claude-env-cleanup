@@ -59,14 +59,14 @@ description: >-
    ```bash
    node <skill目录>/scripts/claude_env_cleanup.cjs netcheck [--json]
    ```
-   只读、不写文件。覆盖 7 个维度：出口 IP 质量（hosting/proxy/mobile 标记、ISP/AS）、DNS 解析归属地（多路检测，含 DoH 兜底）、WebRTC/UDP 泄露（真实 STUN 绑定请求）、Cloudflare 挑战（claude.ai 直连 + cf trace）、IP 类型（住宅/机房）、IPv6 是否启用及出口归属、本地时区/语言与 IP 的对齐度。
+   只读、不写文件。macOS 下自动读取系统代理（`scutil --proxy`）并走与 Claude 相同的出口；需要对比直连时加 `--no-proxy`。覆盖 7 个维度：出口 IP 质量（hosting/proxy/mobile 标记、ISP/AS）、DNS 解析归属地（多路检测，含 DoH 兜底）、WebRTC/UDP 泄露（真实 STUN 绑定请求）、Cloudflare 挑战（claude.ai 直连 + cf trace）、IP 类型（住宅/机房）、IPv6 是否启用及出口归属、本地时区/语言与 IP 的对齐度。
 
 9. **用中文把检测结果讲清楚，并输出"新开 Claude 前置调整建议"清单**。常见建议包括：换住宅 IP、关闭 IPv6、系统时区改为 IP 所在时区、系统语言/区域与 IP 国家对齐、浏览器禁用 WebRTC、统一多协议出口等。
 
 10. **只有用户明确认可后，才可以代为执行系统配置修改**，且逐条确认：
-    - 修改系统时区（Windows：`tzutil /s "<时区ID>"`；macOS：`sudo systemsetup -settimezone`）——修改前告知用户这会影响本机所有应用；
-    - 关闭 IPv6（Windows 管理员：`Disable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6`）——需管理员权限，逐条说明影响；
-    - 修改系统语言/区域、浏览器 Accept-Language 等——通常给用户操作指引，避免代改导致桌面环境混乱。
+    - 修改系统时区（Windows：`tzutil /s "<时区ID>"`；macOS：`sudo systemsetup -settimezone "America/Los_Angeles"`，用 IANA 时区名）——修改前告知用户这会影响本机所有应用；
+    - 关闭 IPv6（Windows 管理员：`Disable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6`；macOS：系统设置→网络→详情→TCP/IP→配置 IPv6 选“仅本地链路”，或 `sudo networksetup -setv6off "Wi-Fi"`）——需管理员权限，逐条说明影响；
+    - 修改系统语言/区域（macOS：系统设置→通用→语言与地区；Windows：设置→时间和语言）、浏览器 Accept-Language 等——通常给用户操作指引，避免代改导致桌面环境混乱。
     用户不认可就只保留建议清单。netcheck 本身不改任何系统配置。
 
 ## 全部动作完成后：总结 + 求星

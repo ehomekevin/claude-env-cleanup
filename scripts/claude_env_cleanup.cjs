@@ -27,6 +27,7 @@ const path = require("path");
 const crypto = require("crypto");
 const http = require("http");
 const https = require("https");
+const tls = require("tls");
 const dgram = require("dgram");
 const dnsPromises = require("dns").promises;
 const { execFileSync } = require("child_process");
@@ -162,22 +163,31 @@ function settingsCandidateFiles(dotClaude) {
 }
 
 // 只读检测 Desktop 日志里的封禁/禁用痕迹（绝不输出 Cookie/凭据内容，只统计命中数）
-const BAN_TRACE_RE = /organization_disabled|organization has been disabled|account (?:has been )?(?:banned|deactivated|suspended)|banned for|device (?:is )?banned/i;
-function detectBanTraces(desktopDir) {
-  const logsDir = path.join(desktopDir, "logs");
+const BAN_TRACE_RE = /account_banned|organization_disabled|org(?:anization)?_banned|organization has been disabled|account (?:has been )?(?:banned|deactivated|suspended)|banned for|device (?:is )?banned/i;
+function banLogDirs(P) {
+  const dirs = [{ dir: path.join(P.desktopDir, "logs"), label: "logs" }];
+  if (P.platform === "darwin") {
+    // macOS 的 Claude Desktop 日志在 ~/Library/Logs/Claude（不在 Application Support/Claude/logs）
+    dirs.push({ dir: path.join(P.home, "Library", "Logs", "Claude"), label: "~/Library/Logs/Claude" });
+  }
+  return dirs;
+}
+function detectBanTraces(P) {
   const hits = [];
-  if (!isRealDir(logsDir)) return hits;
-  let names = [];
-  try { names = fs.readdirSync(logsDir); } catch (_) { return hits; }
-  for (const n of names) {
-    const f = path.join(logsDir, n);
-    let st;
-    try { st = fs.statSync(f); } catch (_) { continue; }
-    if (!st.isFile() || st.size > 64 * 1024 * 1024) continue;
-    let content = "";
-    try { content = fs.readFileSync(f, "utf8"); } catch (_) { continue; }
-    const count = (content.match(BAN_TRACE_RE) || []).length;
-    if (count) hits.push(`logs/${n}: ${count} 处封禁/禁用记录`);
+  for (const { dir, label } of banLogDirs(P)) {
+    if (!isRealDir(dir)) continue;
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch (_) { continue; }
+    for (const n of names) {
+      const f = path.join(dir, n);
+      let st;
+      try { st = fs.statSync(f); } catch (_) { continue; }
+      if (!st.isFile() || st.size > 64 * 1024 * 1024) continue;
+      let content = "";
+      try { content = fs.readFileSync(f, "utf8"); } catch (_) { continue; }
+      const count = (content.match(BAN_TRACE_RE) || []).length;
+      if (count) hits.push(`${label}/${n}: ${count} 处封禁/禁用记录`);
+    }
   }
   return hits;
 }
@@ -286,23 +296,146 @@ function writeJsonAtomic(p, obj) {
 // 清理后的本地网络环境只读检测：IP 质量 / DNS / WebRTC(UDP STUN) 泄露 / Cloudflare 挑战 /
 // IP 类型 / IPv6 状态 / 本地时区语言与 IP 对齐度。绝不写文件、绝不读取凭据。
 
-function httpGet(url, timeoutMs = 6000, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const mod = url.startsWith("http://") ? http : https;
-    const req = mod.get(url, {
-      timeout: timeoutMs,
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36", ...headers },
-    }, (res) => {
-      let body = "";
-      res.setEncoding("utf8");
-      res.on("data", (c) => { body += c; if (body.length > 512 * 1024) req.destroy(); });
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
-    });
-    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-    req.on("error", reject);
-  });
+function platformUA() {
+  // 与 Claude Desktop 的真实 UA 保持同平台，避免检测时用 Windows UA 冒充 macOS 造成额外指纹偏差
+  return process.platform === "darwin"
+    ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 }
 
+// 解析 `scutil --proxy` 的字典文本（macOS 系统代理只在系统层生效，Node 的 http/https 默认忽略它）
+function parseScutilProxyOutput(text) {
+  const val = (k) => {
+    const m = String(text).match(new RegExp(`^\\s*${k}\\s*:\\s*(.+?)\\s*$`, "m"));
+    return m ? m[1].replace(/^"|"$/g, "") : null;
+  };
+  const on = (k) => val(k) === "1";
+  const out = {};
+  if (on("HTTPEnable") && val("HTTPProxy") && val("HTTPPort")) out.http = { host: val("HTTPProxy"), port: Number(val("HTTPPort")) };
+  if (on("HTTPSEnable") && val("HTTPSProxy") && val("HTTPSPort")) out.https = { host: val("HTTPSProxy"), port: Number(val("HTTPSPort")) };
+  if (on("SOCKSEnable") && val("SOCKSProxy") && val("SOCKSPort")) out.socks = { host: val("SOCKSProxy"), port: Number(val("SOCKSPort")) };
+  return out;
+}
+
+function discoverProxy() {
+  const envv = (n) => process.env[n] || process.env[n.toLowerCase()] || null;
+  const raw = envv("HTTPS_PROXY") || envv("ALL_PROXY") || envv("HTTP_PROXY");
+  if (raw) {
+    try {
+      const u = new URL(raw);
+      const mode = u.protocol.replace(":", "");
+      return { mode: mode === "https" ? "http" : mode, host: u.hostname, port: Number(u.port) || (mode === "https" ? 443 : 80), source: "env" };
+    } catch (_) {}
+  }
+  if (process.platform === "darwin") {
+    try {
+      const out = execFileSync("/usr/sbin/scutil", ["--proxy"], { encoding: "utf8", timeout: 2000 });
+      const p = parseScutilProxyOutput(out);
+      const pick = p.https || p.http;
+      if (pick) return { mode: "http", host: pick.host, port: pick.port, source: "scutil" };
+      if (p.socks) return { mode: "socks", host: p.socks.host, port: p.socks.port, source: "scutil" };
+    } catch (_) {}
+  }
+  return null;
+}
+
+// netcheck 期间生效的代理（HTTP/HTTPS CONNECT）。null 表示直连。
+let netProxy = null;
+
+function httpGet(url, timeoutMs = 6000, headers = {}, opts = {}) {
+  const proxy = opts.proxy !== undefined ? opts.proxy : (opts.direct ? null : netProxy);
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const isHttps = u.protocol === "https:";
+    const reqHeaders = { "User-Agent": platformUA(), Accept: "*/*", ...headers };
+    const live = [];
+    let settled = false;
+    const track = (x) => { if (x) live.push(x); return x; };
+    const cleanup = () => { for (const x of live) { try { x.destroy(); } catch (_) {} } live.length = 0; };
+    const timer = setTimeout(() => fail(new Error("timeout")), timeoutMs);
+    if (timer.unref) timer.unref();
+    function fail(e) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(e);
+    }
+    function done(res) {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { body += c; if (body.length > 512 * 1024) res.destroy(); });
+      res.on("error", fail);
+      res.on("end", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const out = { status: res.statusCode, headers: res.headers, body };
+        cleanup();
+        resolve(out);
+      });
+    }
+    if (!proxy) {
+      const mod = isHttps ? https : http;
+      const req = track(mod.request({
+        host: u.hostname,
+        port: u.port || (isHttps ? 443 : 80),
+        path: u.pathname + u.search,
+        headers: reqHeaders,
+      }, done));
+      req.on("error", fail);
+      req.end();
+      return;
+    }
+    if (proxy.mode !== "http") {
+      fail(new Error("仅支持 HTTP/HTTPS 代理，SOCKS 代理未转发"));
+      return;
+    }
+    if (!isHttps) {
+      const req = track(http.request({
+        host: proxy.host,
+        port: proxy.port,
+        path: url, // HTTP 代理使用 absolute-form
+        headers: { ...reqHeaders, Host: u.host },
+      }, done));
+      req.on("error", fail);
+      req.end();
+      return;
+    }
+    const target = `${u.hostname}:${u.port || 443}`;
+    const connectReq = track(http.request({
+      host: proxy.host,
+      port: proxy.port,
+      method: "CONNECT",
+      path: target,
+      headers: { Host: target },
+    }));
+    connectReq.on("connect", (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        fail(new Error(`代理 CONNECT 失败（HTTP ${res.statusCode}）`));
+        return;
+      }
+      const tlsSock = track(tls.connect({ socket, servername: u.hostname }, () => {
+        // 复用 Agent 的 socket 通道，避免 http.request 重新直连目标（会把明文 HTTP 发到 443）
+        const agent = new http.Agent({ keepAlive: false });
+        agent.createConnection = () => tlsSock;
+        const req = track(http.request({
+          host: u.hostname,
+          port: u.port || 443,
+          path: u.pathname + u.search,
+          headers: reqHeaders,
+          agent,
+        }, done));
+        req.on("error", fail);
+        req.end();
+      }));
+      tlsSock.on("error", fail);
+    });
+    connectReq.on("error", fail);
+    connectReq.end();
+  });
+}
 const fetchJSON = async (url, timeoutMs) => { const r = await httpGet(url, timeoutMs); return JSON.parse(r.body); };
 
 function tzOffsetMinutes(tz, date = new Date()) {
@@ -424,9 +557,14 @@ async function dnsEgressCheck() {
   return [];
 }
 
-async function netcheck(P) {
+async function netcheck(P, flags = new Set()) {
   const suggestions = [];
   const local = localLocaleInfo();
+  const proxy = flags.has("--no-proxy") ? null : discoverProxy();
+  netProxy = proxy && proxy.mode === "http" ? proxy : null;
+  if (proxy && proxy.mode !== "http") {
+    suggestions.push(`检测到 ${String(proxy.mode).toUpperCase()} 代理（${proxy.host}:${proxy.port}），当前版本只转发 HTTP/HTTPS 代理；本次检测走直连，出口可能与 Claude 实际出口不同`);
+  }
   const ipRaw = await fetchPublicIPInfo();
   if (ipRaw._err) suggestions.push("无法获取出口 IP 信息（ip-api / ipwho.is / ipapi.co 均不可达），IP 质量与对齐检查可能不准");
   const ipInfo = ipRaw._err ? null : ipRaw;
@@ -441,7 +579,7 @@ async function netcheck(P) {
   const stun = await stunCheck();
   const mappedIP = stun.ok && /^\d+\.\d+\.\d+\.\d+/.test(stun.mappedIP || "") ? stun.mappedIP : null;
   if (stun.ok && ipInfo && mappedIP && !mappedIP.startsWith(ipInfo.query.split(".").slice(0, 2).join("."))) {
-    suggestions.push(`WebRTC/UDP 泄露风险：STUN 映射出口 ${mappedIP} 与 HTTP 出口 ${ipInfo.query} 不同。浏览器 WebRTC 可能绕过代理直连。建议：浏览器禁用 WebRTC 或用扩展拦截 STUN（UDP 19302），或在防火墙拦截 UDP 出站`);
+    suggestions.push(`WebRTC/UDP 泄露风险：STUN 映射出口 ${mappedIP} 与 HTTP 出口 ${ipInfo.query} 不同（STUN 是直连 UDP，不走系统代理）。浏览器 WebRTC 可能绕过代理直连。建议：浏览器禁用 WebRTC 或用扩展拦截 STUN（UDP 19302）；若用 Clash 等，开启 TUN/增强模式让 UDP 也走代理`);
   } else if (!stun.ok) {
     suggestions.push("UDP/STUN 不可达：WebRTC 直连风险低（浏览器同样大概率无法建立 UDP 通道），属安全状态");
   }
@@ -449,12 +587,16 @@ async function netcheck(P) {
   // IPv6
   const v6 = gatherIPv6();
   let v6Public = null;
+  const v6Fix = P.platform === "darwin"
+    ? `系统设置→网络→详情→TCP/IP→配置 IPv6 选“仅本地链路”，或 sudo networksetup -setv6off "Wi-Fi"（按实际网络服务名，影响全机）`
+    : `Windows 管理员 PowerShell：Disable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6`;
   if (v6.length) {
-    v6Public = await httpGet("https://ipv6.icanhazip.com/", 5000).then((r) => r.body.trim()).catch(() => null);
+    // IPv6 检测必须直连：经代理测到的会是代理机房的 IPv6，不是本机真实泄漏
+    v6Public = await httpGet("https://ipv6.icanhazip.com/", 5000, {}, { direct: true }).then((r) => r.body.trim()).catch(() => null);
     if (v6Public) {
       const g = await fetchJSON(`http://ip-api.com/json/${encodeURIComponent(v6Public)}?fields=status,country,countryCode,timezone,isp,query`, 5000).catch(() => null);
       if (g && g.status === "success" && ipInfo && g.countryCode !== ipInfo.countryCode) {
-        suggestions.push(`IPv6 泄露风险：本机有公网 IPv6（${v6Public}，${g.country}），与 IPv4 出口（${ipInfo.country}）不同地区。网站可通过 IPv6 直连看到真实身份。建议关闭 IPv6：管理员 PowerShell 执行 Disable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6，或路由器关闭 IPv6 下发`);
+        suggestions.push(`IPv6 泄露风险：本机有公网 IPv6（${v6Public}，${g.country}），与 IPv4 出口（${ipInfo.country}）不同地区。网站可通过 IPv6 直连看到真实身份。建议关闭 IPv6：${v6Fix}`);
       } else if (g && g.status === "success") {
         suggestions.push(`IPv6 已启用且出口在 ${g.country}，与 IPv4 出口同区；若追求纯净可仍建议关闭，减少一条指纹通道`);
       }
@@ -480,24 +622,32 @@ async function netcheck(P) {
     suggestions.push(`出口不一致：claude.ai 看到的出口是 ${cfTrace.loc}（${cfTrace.ip}），而常规检测出口是 ${ipInfo.countryCode}（${ipInfo.query}）。同一次会话内多地区出口是强风控信号，建议统一出口（IPv6/代理协议配置对齐，只走一条通道）`);
   }
   if (cfChallenge && cfChallenge.challenged) {
-    suggestions.push("Cloudflare 挑战：本次检测访问 claude.ai 被拦截（HTTP 403，可能因脚本 UA 或 IP 质量触发）。建议用浏览器实际打开 claude.ai 复核：若仍被挑战，说明当前出口 IP 风控分数高，需更换更干净的出口再考虑新开账号");
+    suggestions.push(cfChallenge.mitigated === "challenge"
+      ? "Cloudflare 挑战：脚本访问 claude.ai 返回 403（cf-mitigated: challenge）。这通常由非浏览器 TLS 指纹触发，不等于真实浏览器也会被挑战；请用浏览器实际打开 claude.ai 复核，若浏览器也被挑战再考虑更换出口"
+      : `claude.ai 返回 HTTP ${cfChallenge.status}（非 Cloudflare 挑战型，可能是地区/权限限制或 IP 被拒绝）；请用浏览器实际打开 claude.ai 复核`);
   } else if (cfChallenge && cfChallenge.status >= 200 && cfChallenge.status < 400) {
     suggestions.push("Cloudflare 直连通过，未被挑战 ✓");
   }
 
   // 时区 / 语言对齐
   let tzDiff = null;
+  const tzFix = P.platform === "darwin"
+    ? `系统设置→通用→日期与时间，或 sudo systemsetup -settimezone "${ipInfo ? ipInfo.timezone : "<IANA 时区>"}"（需管理员，影响全机所有应用）`
+    : `Windows 管理员：tzutil /s "<Windows 时区 ID>" 或 设置→时间和语言`;
+  const localeFix = P.platform === "darwin"
+    ? `系统设置→通用→语言与地区，把目标语言/地区置顶（浏览器会读系统区域）`
+    : `Windows 设置→时间和语言→语言和区域，添加目标语言并置顶`;
   if (ipInfo && ipInfo.timezone) {
     const ipOff = tzOffsetMinutes(ipInfo.timezone);
     const localOff = tzOffsetMinutes(local.timeZone);
     if (ipOff !== null && localOff !== null) tzDiff = localOff - ipOff;
     if (tzDiff !== 0) {
-      suggestions.push(`时区不对齐：本机 ${local.timeZone} 与 IP 所在地 ${ipInfo.timezone} 相差 ${Math.abs(tzDiff)} 分钟。建议把系统时区改为 IP 所在时区（Windows 管理员：tzutil /s "<Windows 时区 ID>" 或 设置→时间与语言），浏览器环境会读系统时区`);
+      suggestions.push(`时区不对齐：本机 ${local.timeZone} 与 IP 所在地 ${ipInfo.timezone} 相差 ${Math.abs(tzDiff)} 分钟。建议把系统时区改为 IP 所在时区（${tzFix}），浏览器环境会读系统时区`);
     } else {
       suggestions.push("时区与 IP 对齐 ✓");
     }
     if (local.region && ipInfo.countryCode && local.region !== ipInfo.countryCode) {
-      suggestions.push(`语言/地区不对齐：系统区域 ${local.locale}（${local.region}）与 IP 国家 ${ipInfo.countryCode} 不一致。建议：Windows 设置→时间和语言→语言和区域 添加目标语言并置顶；浏览器注意 Accept-Language 头`);
+      suggestions.push(`语言/地区不对齐：系统区域 ${local.locale}（${local.region}）与 IP 国家 ${ipInfo.countryCode} 不一致。建议：${localeFix}；浏览器注意 Accept-Language 头`);
     } else if (local.region && ipInfo.countryCode) {
       suggestions.push("系统区域与 IP 国家对齐 ✓");
     }
@@ -518,9 +668,12 @@ async function netcheck(P) {
   }
 
   // DNS 归属地
+  const dohFix = P.platform === "darwin"
+    ? `macOS：系统设置→网络→详情→DNS，或安装 DoH 描述文件（如 Cloudflare 1.1.1.1）`
+    : `Windows：设置→网络和 Internet→DNS，或启用 DoH`;
   if (dnsGeo && dnsGeo.status === "success" && ipInfo) {
     if (dnsGeo.countryCode !== ipInfo.countryCode) {
-      suggestions.push(`DNS 归属地不一致：解析出口在 ${dnsGeo.country}（${dnsGeo.query}），HTTP 出口在 ${ipInfo.country}。存在 DNS 泄露特征，建议启用与出口同区的加密 DNS（DoH，如 Cloudflare/Google 或出口服务商的 DNS）`);
+      suggestions.push(`DNS 归属地不一致：解析出口在 ${dnsGeo.country}（${dnsGeo.query}），HTTP 出口在 ${ipInfo.country}。存在 DNS 泄露特征，建议启用与出口同区的加密 DNS（${dohFix}）`);
     } else {
       suggestions.push(`DNS 与出口 IP 同区 ✓（解析出口 ${dnsGeo.query}，${dnsGeo.city}）`);
     }
@@ -530,6 +683,8 @@ async function netcheck(P) {
 
   return {
     checkedAt: new Date().toISOString(),
+    platform: P.platform,
+    proxy: proxy ? { ...proxy, forwarded: proxy.mode === "http" } : null,
     local: local,
     ip: ipInfo ? { query: ipInfo.query, country: `${ipInfo.country}(${ipInfo.countryCode})`, region: ipInfo.regionName, city: ipInfo.city, timezone: ipInfo.timezone, isp: ipInfo.isp, org: ipInfo.org, as: ipInfo.as, mobile: !!ipInfo.mobile, proxy: !!ipInfo.proxy, hosting: !!ipInfo.hosting } : null,
     dns: { resolvers: dnsResolvers, geo: dnsGeo && dnsGeo.status === "success" ? { query: dnsGeo.query, country: `${dnsGeo.country}(${dnsGeo.countryCode})`, city: dnsGeo.city, isp: dnsGeo.isp } : null },
@@ -538,7 +693,7 @@ async function netcheck(P) {
     cloudflare: { trace: cfTrace, challenge: cfChallenge },
     tzDiffMinutes: tzDiff,
     suggestions,
-    note: "本检测只读、不写文件；请求会访问 ip-api.com / whoami.cloudflare / stun.l.google.com / claude.ai 等公开服务",
+    note: "本检测只读、不写文件；请求会访问 ip-api.com / whoami.cloudflare / stun.l.google.com / claude.ai 等公开服务。macOS 下自动走系统代理（scutil --proxy），STUN/UDP 检测为直连；加 --no-proxy 可强制直连对比",
   };
 }
 
@@ -555,6 +710,9 @@ function printNetcheck(r) {
   }
   L.push(`\n[本地环境] 时区 ${r.local.timeZone} | 区域 ${r.local.locale}`);
   L.push(`  时区偏差: ${r.tzDiffMinutes === null ? "未知" : r.tzDiffMinutes + " 分钟"}`);
+  L.push(`\n[代理] ${r.proxy
+    ? `${r.proxy.source === "scutil" ? "macOS 系统代理" : "环境变量代理"} ${r.proxy.host}:${r.proxy.port}${r.proxy.forwarded ? "（检测已走该出口）" : "（SOCKS 未转发，检测为直连）"}`
+    : "未检测到代理，检测为直连"}`);
   L.push(`\n[DNS] ${r.dns.resolvers.length ? r.dns.resolvers.join(", ") : "未知"}`);
   if (r.dns.geo) L.push(`  解析出口: ${r.dns.geo.country} ${r.dns.geo.city} (${r.dns.geo.query})`);
   L.push(`\n[WebRTC/UDP STUN] ${r.webrtcUDP.ok ? `映射出口 ${r.webrtcUDP.mappedIP}` : "UDP 不可达（WebRTC 直连风险低）"}${r.webrtcUDP.note ? " — " + r.webrtcUDP.note : ""}`);
@@ -606,7 +764,7 @@ function scan(P) {
   if (keychainExists(KEYCHAIN_DESKTOP, P.isRealHome)) keychain.push(`Keychain: ${KEYCHAIN_DESKTOP}`);
   if (!P.isRealHome || P.platform !== "darwin") notes.push("非真实 HOME 或非 macOS：已跳过 Keychain 与 defaults 检查");
 
-  banTrace.push(...detectBanTraces(P.desktopDir));
+  banTrace.push(...detectBanTraces(P));
 
   const relayRe = /^\s*(export\s+)?(ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY)|HTTPS?_PROXY|ALL_PROXY|https?_proxy|all_proxy)\s*=/;
   const rcHits = [];
@@ -840,13 +998,13 @@ async function main() {
       out = clean(P, args.flags);
       asJson ? console.log(JSON.stringify(out, null, 2)) : printClean(out);
     } else if (args.cmd === "netcheck") {
-      out = await netcheck(P);
+      out = await netcheck(P, args.flags);
       asJson ? console.log(JSON.stringify(out, null, 2)) : printNetcheck(out);
     } else if (args.cmd === "restore") {
       out = restore(P, args.from, args.flags);
       console.log(asJson ? JSON.stringify(out, null, 2) : `已还原 ${out.restored.length} 项，跳过 ${out.skipped.length} 项${out.note ? "。" + out.note : ""}`);
     } else {
-      console.error("未知命令。可用: scan | netcheck | clean --yes | restore --from <dir>");
+      console.error("未知命令。可用: scan | netcheck [--no-proxy] | clean --yes | restore --from <dir>");
       process.exit(2);
     }
   } catch (e) {
@@ -856,4 +1014,6 @@ async function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { parseScutilProxyOutput, discoverProxy, platformUA, settingsCandidateFiles, banLogDirs, resolvePaths, httpGet };
