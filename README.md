@@ -11,6 +11,7 @@
 | 命令 | 作用 |
 | :--- | :--- |
 | `scan` | 只读扫描。不写任何文件，不读取也不输出任何凭据、Cookie 内容或 Keychain 密码 |
+| `netcheck` | 清理后的网络环境只读检测：IP 质量/类型、DNS 归属地、WebRTC/UDP 泄露（真实 STUN）、Cloudflare 挑战、IPv6、时区/语言对齐，并输出新开 Claude 前的前置调整建议 |
 | `clean --yes` | 备份后清理。不加 `--yes` 拒绝执行；Claude 仍在运行时拒绝执行 |
 | `restore --from <备份目录>` | 从备份还原，默认不覆盖已存在文件，加 `--force` 完整回滚 |
 
@@ -33,6 +34,23 @@
 - **B. 不备份**：清理后直接删除备份目录，本机零残留（不可还原）
 
 Agent skill 流程会在清理前让用户二选一；直接命令行使用时请手动处理备份目录。
+
+## 网络环境检测（v0.2 新增）
+
+```bash
+node scripts/claude_env_cleanup.cjs netcheck
+```
+
+清理只解决"本机"残留，但新开 Claude 前还有网络层指纹要过关。`netcheck` 覆盖：
+
+- **IP 质量/类型**：hosting（机房）/proxy（被标记代理）/mobile 标记、ISP、AS 归属（ip-api → ipwho.is → ipapi.co 多源兜底）
+- **DNS 归属地**：系统解析器与 DoH 多路检测，判断 DNS 是否与出口同区（DNS 泄露）
+- **WebRTC/UDP 泄露**：真实 STUN 绑定请求（与浏览器 WebRTC 同机制），看 UDP 出口是否绕过代理
+- **Cloudflare 挑战**：claude.ai 直连是否被挑战 + cf trace 出口信息，并与常规出口交叉比对（多地区出口是强风控信号）
+- **IPv6**：是否启用、公网出口归属地是否与 IPv4 出口一致
+- **时区/语言对齐**：系统时区、locale 与 IP 所在时区/国家的偏差
+
+输出包含逐条"前置调整建议"（换住宅 IP、关 IPv6、改系统时区/语言、禁用 WebRTC 等）。agent 按此流程使用时：先给建议清单，用户认可后才代为执行系统配置修改（需管理员权限的逐条确认）。
 
 ## 快速开始
 

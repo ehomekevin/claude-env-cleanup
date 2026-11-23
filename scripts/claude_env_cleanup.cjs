@@ -6,6 +6,7 @@
  *
  * 用法：
  *   node claude_env_cleanup.cjs scan [--json]                     只读扫描（默认）
+ *   node claude_env_cleanup.cjs netcheck [--json]                 清理后的网络环境只读检测（IP/DNS/WebRTC/Cloudflare/IPv6/时区语言对齐）
  *   node claude_env_cleanup.cjs clean --yes [--keychain] [--keychain-desktop] [--keep-relay] [--json]
  *   node claude_env_cleanup.cjs restore --from <备份目录> [--force] [--json]
  *   通用：--home <dir>  指定 HOME（测试用；非真实 HOME 时自动跳过 Keychain/defaults）
@@ -24,6 +25,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
+const http = require("http");
+const https = require("https");
+const dgram = require("dgram");
+const dnsPromises = require("dns").promises;
 const { execFileSync } = require("child_process");
 
 const DESKTOP_RESET_TARGETS = [
@@ -275,6 +280,293 @@ function writeJsonAtomic(p, obj) {
   const tmp = `${p}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n", { mode: 0o600 });
   fs.renameSync(tmp, p);
+}
+
+// ---------------------------------------------------------------- netcheck
+// 清理后的本地网络环境只读检测：IP 质量 / DNS / WebRTC(UDP STUN) 泄露 / Cloudflare 挑战 /
+// IP 类型 / IPv6 状态 / 本地时区语言与 IP 对齐度。绝不写文件、绝不读取凭据。
+
+function httpGet(url, timeoutMs = 6000, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith("http://") ? http : https;
+    const req = mod.get(url, {
+      timeout: timeoutMs,
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36", ...headers },
+    }, (res) => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { body += c; if (body.length > 512 * 1024) req.destroy(); });
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    });
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.on("error", reject);
+  });
+}
+
+const fetchJSON = async (url, timeoutMs) => { const r = await httpGet(url, timeoutMs); return JSON.parse(r.body); };
+
+function tzOffsetMinutes(tz, date = new Date()) {
+  try {
+    const dtf = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const parts = Object.fromEntries(dtf.formatToParts(date).map((p) => [p.type, p.value]));
+    const asUTC = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour) % 24, Number(parts.minute), Number(parts.second));
+    return (asUTC - Math.floor(date.getTime() / 1000) * 1000) / 60000;
+  } catch (_) { return null; }
+}
+
+// 真 STUN 绑定请求（浏览器 WebRTC 泄露用的同一机制）：看 UDP 出口映射到的公网 IP
+function stunCheck(server = "stun.l.google.com", port = 19302, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (r) => { if (!done) { done = true; try { sock.close(); } catch (_) {} resolve(r); } };
+    const sock = dgram.createSocket("udp4");
+    const txid = crypto.randomBytes(12);
+    const msg = Buffer.alloc(20);
+    msg.writeUInt16BE(0x0001, 0); msg.writeUInt16BE(0, 2); msg.writeUInt32BE(0x2112A442, 4);
+    txid.copy(msg, 8);
+    const parseAddr = (buf, v) => {
+      // v = 属性值起始偏移
+      const family = buf.readUInt16BE(v);
+      if (family === 0x01) return [buf[v + 4], buf[v + 5], buf[v + 6], buf[v + 7]].join(".");
+      if (family === 0x02) {
+        const ip = [];
+        for (let i = 0; i < 16; i += 2) ip.push(buf.readUInt16BE(v + 4 + i).toString(16));
+        return ip.join(":");
+      }
+      return null;
+    };
+    const xorAddr = (buf, v) => {
+      const family = buf.readUInt16BE(v);
+      if (family !== 0x01) return null;
+      const p = buf.readUInt32BE(v + 4) ^ 0x2112A442;
+      const port = (buf.readUInt16BE(v + 2) ^ 0x2112) & 0xffff;
+      return [(p >>> 24) & 255, (p >>> 16) & 255, (p >>> 8) & 255, p & 255].join(".") + ` (port ${port})`;
+    };
+    sock.on("message", (data) => {
+      try {
+        let mapped = null;
+        for (let off = 20; off + 4 <= data.length;) {
+          const type = data.readUInt16BE(off); const len = data.readUInt16BE(off + 2);
+          const v = off + 4;
+          if (type === 0x0020) mapped = xorAddr(data, v);          // XOR-MAPPED-ADDRESS
+          else if (type === 0x0001 && !mapped) mapped = parseAddr(data, v); // MAPPED-ADDRESS
+          off += 4 + len + (len % 4);
+        }
+        finish({ ok: true, mappedIP: mapped || "响应中无地址属性", note: "UDP 可出站，浏览器 WebRTC 可能直连" });
+      } catch (_) { finish({ ok: true, mappedIP: "解析失败", note: "" }); }
+    });
+    sock.on("error", () => finish({ ok: false, mappedIP: null, note: "UDP 出站错误（可能被防火墙拦截）" }));
+    sock.bind(() => {
+      const t = setTimeout(() => finish({ ok: false, mappedIP: null, note: "STUN 无响应（UDP 被拦截或网络不支持）" }), timeoutMs);
+      t.unref();
+      sock.send(msg, port, server, (e) => { if (e) finish({ ok: false, mappedIP: null, note: "STUN 请求发送失败" }); });
+    });
+  });
+}
+
+function localLocaleInfo() {
+  const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+  const m = locale.match(/-([A-Za-z]{2})\b/);
+  return { locale, region: m ? m[1].toUpperCase() : null, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone };
+}
+
+function gatherIPv6() {
+  const out = [];
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (a.family === "IPv6" && !a.internal && !/^(fe80|fc00|fd00)/i.test(a.address)) {
+        out.push({ adapter: name, address: a.address.replace(/%.*/, "") });
+      }
+    }
+  }
+  return out;
+}
+
+async function fetchPublicIPInfo() {
+  // 依次尝试：ip-api（http，字段最全含 proxy/hosting/mobile）→ ipwho.is（https）→ ipapi.co（https）
+  try {
+    const j = await fetchJSON("http://ip-api.com/json/?fields=status,message,country,countryCode,regionName,city,timezone,isp,org,as,mobile,proxy,hosting,query", 7000);
+    if (j.status === "success") return { source: "ip-api", query: j.query, country: j.country, countryCode: j.countryCode, regionName: j.regionName, city: j.city, timezone: j.timezone, isp: j.isp, org: j.org, as: j.as, mobile: !!j.mobile, proxy: !!j.proxy, hosting: !!j.hosting };
+  } catch (_) {}
+  try {
+    const j = await fetchJSON("https://ipwho.is/", 8000);
+    if (j.success !== false) return { source: "ipwho.is", query: j.ip, country: j.country, countryCode: j.country_code, regionName: j.region, city: j.city, timezone: j.timezone && j.timezone.id, isp: j.connection && j.connection.isp, org: j.connection && j.connection.org, as: j.connection && j.connection.asn !== undefined ? "AS" + j.connection.asn : null, mobile: null, proxy: null, hosting: j.type === "IPv6" ? null : null };
+  } catch (_) {}
+  try {
+    const j = await fetchJSON("https://ipapi.co/json/", 8000);
+    if (j.ip) return { source: "ipapi.co", query: j.ip, country: j.country_name, countryCode: j.country_code, regionName: j.region, city: j.city, timezone: j.timezone, isp: j.org, org: j.org, as: j.asn, mobile: null, proxy: null, hosting: null };
+  } catch (_) {}
+  return { _err: "所有 IP 信息源均不可达" };
+}
+
+async function dnsEgressCheck() {
+  // 多路尝试获取"DNS 解析出口"：系统解析器查 whoami.cloudflare / o-o.myaddr.l.google.com，失败再走 DoH JSON API
+  const ipLike = (s) => /^\d{1,3}(\.\d{1,3}){3}$/.test(s) || /^[0-9a-fA-F:]+:[0-9a-fA-F]*:[0-9a-fA-F:]+$/.test(s);
+  const collect = (arr) => [...new Set(arr.map((s) => String(s).replace(/^"|"$/g, "").trim()).filter(ipLike))];
+  try {
+    const r = collect((await dnsPromises.resolveTxt("whoami.cloudflare")).map((t) => t.join("")));
+    if (r.length) return r;
+  } catch (_) {}
+  try {
+    const r = collect((await dnsPromises.resolveTxt("o-o.myaddr.l.google.com")).map((t) => t.join("")));
+    if (r.length) return r;
+  } catch (_) {}
+  try {
+    const j = await fetchJSON("https://dns.google/resolve?name=o-o.myaddr.l.google.com&type=TXT", 7000);
+    const r = collect((j.Answer || []).map((a) => a.data));
+    if (r.length) return r;
+  } catch (_) {}
+  try {
+    const j = await fetchJSON("https://cloudflare-dns.com/dns-query?name=o-o.myaddr.l.google.com&type=TXT", 7000, { Accept: "application/dns-json" });
+    const r = collect((j.Answer || []).map((a) => a.data));
+    if (r.length) return r;
+  } catch (_) {}
+  return [];
+}
+
+async function netcheck(P) {
+  const suggestions = [];
+  const local = localLocaleInfo();
+  const ipRaw = await fetchPublicIPInfo();
+  if (ipRaw._err) suggestions.push("无法获取出口 IP 信息（ip-api / ipwho.is / ipapi.co 均不可达），IP 质量与对齐检查可能不准");
+  const ipInfo = ipRaw._err ? null : ipRaw;
+
+  const dnsResolvers = await dnsEgressCheck();
+  let dnsGeo = null;
+  if (dnsResolvers.length) {
+    dnsGeo = await fetchJSON(`http://ip-api.com/json/${encodeURIComponent(dnsResolvers[0])}?fields=status,country,countryCode,city,isp,query`, 5000).catch(() => null);
+  }
+
+  // WebRTC / UDP 泄露（真实 STUN 绑定）
+  const stun = await stunCheck();
+  const mappedIP = stun.ok && /^\d+\.\d+\.\d+\.\d+/.test(stun.mappedIP || "") ? stun.mappedIP : null;
+  if (stun.ok && ipInfo && mappedIP && !mappedIP.startsWith(ipInfo.query.split(".").slice(0, 2).join("."))) {
+    suggestions.push(`WebRTC/UDP 泄露风险：STUN 映射出口 ${mappedIP} 与 HTTP 出口 ${ipInfo.query} 不同。浏览器 WebRTC 可能绕过代理直连。建议：浏览器禁用 WebRTC 或用扩展拦截 STUN（UDP 19302），或在防火墙拦截 UDP 出站`);
+  } else if (!stun.ok) {
+    suggestions.push("UDP/STUN 不可达：WebRTC 直连风险低（浏览器同样大概率无法建立 UDP 通道），属安全状态");
+  }
+
+  // IPv6
+  const v6 = gatherIPv6();
+  let v6Public = null;
+  if (v6.length) {
+    v6Public = await httpGet("https://ipv6.icanhazip.com/", 5000).then((r) => r.body.trim()).catch(() => null);
+    if (v6Public) {
+      const g = await fetchJSON(`http://ip-api.com/json/${encodeURIComponent(v6Public)}?fields=status,country,countryCode,timezone,isp,query`, 5000).catch(() => null);
+      if (g && g.status === "success" && ipInfo && g.countryCode !== ipInfo.countryCode) {
+        suggestions.push(`IPv6 泄露风险：本机有公网 IPv6（${v6Public}，${g.country}），与 IPv4 出口（${ipInfo.country}）不同地区。网站可通过 IPv6 直连看到真实身份。建议关闭 IPv6：管理员 PowerShell 执行 Disable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6，或路由器关闭 IPv6 下发`);
+      } else if (g && g.status === "success") {
+        suggestions.push(`IPv6 已启用且出口在 ${g.country}，与 IPv4 出口同区；若追求纯净可仍建议关闭，减少一条指纹通道`);
+      }
+    } else {
+      suggestions.push(`本机网卡有 IPv6 地址但无公网 IPv6 出口（实际不可达），泄露风险低；洁癖可选关闭`);
+    }
+  } else {
+    suggestions.push("IPv6 未启用或无全局地址：符合推荐前置状态 ✓");
+  }
+
+  // Cloudflare / claude.ai 挑战
+  let cfTrace = null, cfChallenge = null;
+  try {
+    const t = await httpGet("https://claude.ai/cdn-cgi/trace", 7000);
+    cfTrace = Object.fromEntries(t.body.trim().split("\n").map((l) => l.split("=")).filter((p) => p.length === 2));
+  } catch (_) { cfTrace = { _err: "不可达" }; }
+  try {
+    const home = await httpGet("https://claude.ai/", 8000);
+    const chal = home.status === 403 || home.status === 429 || /just a moment|cf-chl|challenge-platform/i.test(home.body) || home.headers["cf-mitigated"];
+    cfChallenge = { status: home.status, challenged: !!chal, mitigated: home.headers["cf-mitigated"] || null };
+  } catch (_) { cfChallenge = { status: "error", challenged: null }; }
+  if (cfTrace && cfTrace.loc && ipInfo && ipInfo.countryCode && cfTrace.loc !== ipInfo.countryCode) {
+    suggestions.push(`出口不一致：claude.ai 看到的出口是 ${cfTrace.loc}（${cfTrace.ip}），而常规检测出口是 ${ipInfo.countryCode}（${ipInfo.query}）。同一次会话内多地区出口是强风控信号，建议统一出口（IPv6/代理协议配置对齐，只走一条通道）`);
+  }
+  if (cfChallenge && cfChallenge.challenged) {
+    suggestions.push("Cloudflare 挑战：本次检测访问 claude.ai 被拦截（HTTP 403，可能因脚本 UA 或 IP 质量触发）。建议用浏览器实际打开 claude.ai 复核：若仍被挑战，说明当前出口 IP 风控分数高，需更换更干净的出口再考虑新开账号");
+  } else if (cfChallenge && cfChallenge.status >= 200 && cfChallenge.status < 400) {
+    suggestions.push("Cloudflare 直连通过，未被挑战 ✓");
+  }
+
+  // 时区 / 语言对齐
+  let tzDiff = null;
+  if (ipInfo && ipInfo.timezone) {
+    const ipOff = tzOffsetMinutes(ipInfo.timezone);
+    const localOff = tzOffsetMinutes(local.timeZone);
+    if (ipOff !== null && localOff !== null) tzDiff = localOff - ipOff;
+    if (tzDiff !== 0) {
+      suggestions.push(`时区不对齐：本机 ${local.timeZone} 与 IP 所在地 ${ipInfo.timezone} 相差 ${Math.abs(tzDiff)} 分钟。建议把系统时区改为 IP 所在时区（Windows 管理员：tzutil /s "<Windows 时区 ID>" 或 设置→时间与语言），浏览器环境会读系统时区`);
+    } else {
+      suggestions.push("时区与 IP 对齐 ✓");
+    }
+    if (local.region && ipInfo.countryCode && local.region !== ipInfo.countryCode) {
+      suggestions.push(`语言/地区不对齐：系统区域 ${local.locale}（${local.region}）与 IP 国家 ${ipInfo.countryCode} 不一致。建议：Windows 设置→时间和语言→语言和区域 添加目标语言并置顶；浏览器注意 Accept-Language 头`);
+    } else if (local.region && ipInfo.countryCode) {
+      suggestions.push("系统区域与 IP 国家对齐 ✓");
+    }
+  }
+
+  // IP 类型 / 质量
+  if (ipInfo) {
+    const tags = [];
+    if (ipInfo.hosting) tags.push("数据中心/机房 IP（hosting）");
+    if (ipInfo.proxy) tags.push("被标记为代理/VPN（proxy）");
+    if (ipInfo.mobile) tags.push("移动网络 IP（mobile）");
+    if (!tags.length) tags.push("普通宽带（大概率住宅/家宽）");
+    const quality = ipInfo.hosting || ipInfo.proxy ? "风控敏感：Claude 对数据中心与已标记代理 IP 更严格" : "较好";
+    suggestions.push(`IP 类型：${tags.join("；")}。IP 质量评估：${quality}（ISP: ${ipInfo.isp}，AS: ${ipInfo.as}，位置: ${ipInfo.country} ${ipInfo.city}）`);
+    if (ipInfo.hosting || ipInfo.proxy) {
+      suggestions.push("建议：新开账号前尽量换住宅/家宽 IP（或干净的住宅代理），避免与已封账号共享出口");
+    }
+  }
+
+  // DNS 归属地
+  if (dnsGeo && dnsGeo.status === "success" && ipInfo) {
+    if (dnsGeo.countryCode !== ipInfo.countryCode) {
+      suggestions.push(`DNS 归属地不一致：解析出口在 ${dnsGeo.country}（${dnsGeo.query}），HTTP 出口在 ${ipInfo.country}。存在 DNS 泄露特征，建议启用与出口同区的加密 DNS（DoH，如 Cloudflare/Google 或出口服务商的 DNS）`);
+    } else {
+      suggestions.push(`DNS 与出口 IP 同区 ✓（解析出口 ${dnsGeo.query}，${dnsGeo.city}）`);
+    }
+  } else if (!dnsResolvers.length) {
+    suggestions.push("无法获取 DNS 解析出口信息（whoami.cloudflare 查询失败），跳过 DNS 泄露判断");
+  }
+
+  return {
+    checkedAt: new Date().toISOString(),
+    local: local,
+    ip: ipInfo ? { query: ipInfo.query, country: `${ipInfo.country}(${ipInfo.countryCode})`, region: ipInfo.regionName, city: ipInfo.city, timezone: ipInfo.timezone, isp: ipInfo.isp, org: ipInfo.org, as: ipInfo.as, mobile: !!ipInfo.mobile, proxy: !!ipInfo.proxy, hosting: !!ipInfo.hosting } : null,
+    dns: { resolvers: dnsResolvers, geo: dnsGeo && dnsGeo.status === "success" ? { query: dnsGeo.query, country: `${dnsGeo.country}(${dnsGeo.countryCode})`, city: dnsGeo.city, isp: dnsGeo.isp } : null },
+    webrtcUDP: stun,
+    ipv6: { adapters: v6, publicEgress: v6Public },
+    cloudflare: { trace: cfTrace, challenge: cfChallenge },
+    tzDiffMinutes: tzDiff,
+    suggestions,
+    note: "本检测只读、不写文件；请求会访问 ip-api.com / whoami.cloudflare / stun.l.google.com / claude.ai 等公开服务",
+  };
+}
+
+function printNetcheck(r) {
+  const L = [];
+  L.push(`Claude 网络环境检测  ${r.checkedAt}`);
+  if (r.ip) {
+    L.push(`\n[出口 IP] ${r.ip.query}  ${r.ip.country} ${r.ip.city}`);
+    L.push(`  ISP: ${r.ip.isp} | org: ${r.ip.org} | AS: ${r.ip.as}`);
+    L.push(`  类型: ${[r.ip.hosting && "hosting(机房)", r.ip.proxy && "proxy(被标记)", r.ip.mobile && "mobile"].filter(Boolean).join(", ") || "普通宽带"}`);
+    L.push(`  IP 时区: ${r.ip.timezone}`);
+  } else {
+    L.push("\n[出口 IP] 获取失败");
+  }
+  L.push(`\n[本地环境] 时区 ${r.local.timeZone} | 区域 ${r.local.locale}`);
+  L.push(`  时区偏差: ${r.tzDiffMinutes === null ? "未知" : r.tzDiffMinutes + " 分钟"}`);
+  L.push(`\n[DNS] ${r.dns.resolvers.length ? r.dns.resolvers.join(", ") : "未知"}`);
+  if (r.dns.geo) L.push(`  解析出口: ${r.dns.geo.country} ${r.dns.geo.city} (${r.dns.geo.query})`);
+  L.push(`\n[WebRTC/UDP STUN] ${r.webrtcUDP.ok ? `映射出口 ${r.webrtcUDP.mappedIP}` : "UDP 不可达（WebRTC 直连风险低）"}${r.webrtcUDP.note ? " — " + r.webrtcUDP.note : ""}`);
+  L.push(`\n[IPv6] ${r.ipv6.publicEgress ? `公网出口 ${r.ipv6.publicEgress}` : r.ipv6.adapters.length ? "有地址但无公网出口" : "未启用"}`);
+  if (r.cloudflare.trace && r.cloudflare.trace.ip !== undefined) L.push(`\n[Cloudflare trace] ip=${r.cloudflare.trace.ip} loc=${r.cloudflare.trace.loc} warp=${r.cloudflare.trace.warp} tls=${r.cloudflare.trace.tls}`);
+  if (r.cloudflare.challenge) L.push(`  claude.ai 访问: HTTP ${r.cloudflare.challenge.status} ${r.cloudflare.challenge.challenged ? "⚠ 被挑战/拦截" : r.cloudflare.challenge.status < 400 ? "✓ 未被挑战" : ""}`);
+  if (r.suggestions.length) {
+    L.push("\n[前置调整建议]（新开 Claude 前）");
+    for (const s of r.suggestions) L.push(`  - ${s}`);
+  }
+  L.push(`\n提示: ${r.note}`);
+  console.log(L.join("\n"));
 }
 
 // ---------------------------------------------------------------- scan
@@ -535,7 +827,7 @@ function printClean(r) {
   console.log(L.join("\n"));
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv);
   const P = resolvePaths(args.home);
   const asJson = args.flags.has("--json");
@@ -547,11 +839,14 @@ function main() {
     } else if (args.cmd === "clean") {
       out = clean(P, args.flags);
       asJson ? console.log(JSON.stringify(out, null, 2)) : printClean(out);
+    } else if (args.cmd === "netcheck") {
+      out = await netcheck(P);
+      asJson ? console.log(JSON.stringify(out, null, 2)) : printNetcheck(out);
     } else if (args.cmd === "restore") {
       out = restore(P, args.from, args.flags);
       console.log(asJson ? JSON.stringify(out, null, 2) : `已还原 ${out.restored.length} 项，跳过 ${out.skipped.length} 项${out.note ? "。" + out.note : ""}`);
     } else {
-      console.error("未知命令。可用: scan | clean --yes | restore --from <dir>");
+      console.error("未知命令。可用: scan | netcheck | clean --yes | restore --from <dir>");
       process.exit(2);
     }
   } catch (e) {

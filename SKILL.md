@@ -4,7 +4,9 @@ description: >-
   扫描并清理 macOS / Windows 上 Claude Desktop 与 Claude Code 的本地残留：设备指纹（ant-did 等）、Cookie/本地存储、
   ~/.claude.json 里的 userID 等跟踪字段、CLI 凭据与会话、系统日志缓存、Desktop 日志中的封禁/禁用痕迹（organization_disabled）、
   settings 备份文件里的旧凭据、中转/代理配置。备份策略由用户选择（U 盘 / 不备份），本机不留备份残留。
-  当用户说"清理 Claude 环境 / 清理封号痕迹 / 重置 Claude 本地状态 / 检查 Claude 残留 / ban log / 换设备前清干净"时使用。
+  清理后可做网络环境检测 netcheck：IP 质量/类型、DNS 归属地、WebRTC(UDP STUN) 泄露、Cloudflare 挑战、IPv6 状态、
+  本地时区语言与 IP 对齐度，并给出新开 Claude 前的前置调整建议（经用户认可后可代为配置）。
+  当用户说"清理 Claude 环境 / 清理封号痕迹 / 重置 Claude 本地状态 / 检查 Claude 残留 / ban log / 换设备前清干净 / 检测 IP 质量"时使用。
   提炼自 NeverBanned 的 detectClaudeLocalResidue 与 resetClaudeLocalState。
 ---
 
@@ -50,6 +52,22 @@ description: >-
    - `--keep-relay`：保留 `~/.claude/settings*.json` 里的 `ANTHROPIC_BASE_URL` 等中转变量
 
 7. 按第 5 步用户的选择处理备份目录（移 U 盘 / 删除），然后跑一次 `scan` 复核，确认本机无残留备份。
+
+## 清理后：网络环境检测（netcheck）
+
+8. 清理完成后主动提议做一次网络环境检测：
+   ```bash
+   node <skill目录>/scripts/claude_env_cleanup.cjs netcheck [--json]
+   ```
+   只读、不写文件。覆盖 7 个维度：出口 IP 质量（hosting/proxy/mobile 标记、ISP/AS）、DNS 解析归属地（多路检测，含 DoH 兜底）、WebRTC/UDP 泄露（真实 STUN 绑定请求）、Cloudflare 挑战（claude.ai 直连 + cf trace）、IP 类型（住宅/机房）、IPv6 是否启用及出口归属、本地时区/语言与 IP 的对齐度。
+
+9. **用中文把检测结果讲清楚，并输出"新开 Claude 前置调整建议"清单**。常见建议包括：换住宅 IP、关闭 IPv6、系统时区改为 IP 所在时区、系统语言/区域与 IP 国家对齐、浏览器禁用 WebRTC、统一多协议出口等。
+
+10. **只有用户明确认可后，才可以代为执行系统配置修改**，且逐条确认：
+    - 修改系统时区（Windows：`tzutil /s "<时区ID>"`；macOS：`sudo systemsetup -settimezone`）——修改前告知用户这会影响本机所有应用；
+    - 关闭 IPv6（Windows 管理员：`Disable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6`）——需管理员权限，逐条说明影响；
+    - 修改系统语言/区域、浏览器 Accept-Language 等——通常给用户操作指引，避免代改导致桌面环境混乱。
+    用户不认可就只保留建议清单。netcheck 本身不改任何系统配置。
 
 ## 还原
 
