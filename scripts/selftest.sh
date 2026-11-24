@@ -1,8 +1,8 @@
 #!/bin/bash
 # 在临时假 HOME 中做正反双向实测：scan → clean 拒绝(无 --yes) → clean → 白名单核验 → scan 干净 → restore
 set -u
-S="$(cd "$(dirname "$0")" && pwd)/claude_env_cleanup.cjs"
-H="$(mktemp -d /tmp/cec-test.XXXXXX)"
+S="$(cd "$(dirname "$0")" && pwd)/claude_neverbanned_skills.cjs"
+H="$(mktemp -d /tmp/cns-test.XXXXXX)"
 fail=0
 ok()  { echo "PASS  $1"; }
 bad() { echo "FAIL  $1"; fail=1; }
@@ -72,8 +72,8 @@ node "$S" restore --from "$BK" --home "$H" --force >/dev/null && node -e 'const 
 # 安装器适配层（使用独立的假 HOME / 项目目录）
 IH="$H/inst-home"; IP="$H/inst-project"; IDIR="$(dirname "$S")"
 node "$IDIR/install.cjs" --list | grep -q 'claude-code' && ok "installer: 列表" || bad "installer: 列表"
-node "$IDIR/install.cjs" --home "$IH" --agent claude-code >/dev/null && [ -L "$IH/.claude/skills/claude-env-cleanup" ] && ok "installer: 用户级 symlink" || bad "installer: 用户级 symlink"
-node "$IDIR/install.cjs" --project "$IP" --agent codex --copy >/dev/null && [ -f "$IP/.agents/skills/claude-env-cleanup/SKILL.md" ] && ok "installer: 项目级 copy" || bad "installer: 项目级 copy"
+node "$IDIR/install.cjs" --home "$IH" --agent claude-code >/dev/null && [ -L "$IH/.claude/skills/claude-neverbanned-skills" ] && ok "installer: 用户级 symlink" || bad "installer: 用户级 symlink"
+node "$IDIR/install.cjs" --project "$IP" --agent codex --copy >/dev/null && [ -f "$IP/.agents/skills/claude-neverbanned-skills/SKILL.md" ] && ok "installer: 项目级 copy" || bad "installer: 项目级 copy"
 node "$IDIR/install.cjs" --home "$IH" --agent claude-code | grep -q "已存在" && ok "installer: 幂等" || bad "installer: 幂等"
 
 rm -rf "$H"

@@ -1,4 +1,4 @@
-# claude-env-cleanup
+# Claude NeverBanned Skills
 
 扫描并清理 macOS / Windows 上 **Claude Desktop** 与 **Claude Code** 的本地残留，备份策略由你选择（U 盘 / 不备份），支持一键还原。
 
@@ -28,7 +28,7 @@
 
 ## 备份策略（v0.2 新增）
 
-本机的 `~/.claude-env-cleanup-backups/` 目录只是中转，两种收尾方式：
+本机的 `~/.claude-neverbanned-skills-backups/` 目录只是中转，两种收尾方式：
 
 - **A. 备份到 U 盘**：清理后把备份目录移动到 U 盘，核对无误后删除本机副本
 - **B. 不备份**：清理后直接删除备份目录，本机零残留（不可还原）
@@ -38,7 +38,7 @@ Agent skill 流程会在清理前让用户二选一；直接命令行使用时�
 ## 网络环境检测（v0.2 新增）
 
 ```bash
-node scripts/claude_env_cleanup.cjs netcheck
+node scripts/claude_neverbanned_skills.cjs netcheck
 ```
 
 清理只解决"本机"残留，但新开 Claude 前还有网络层指纹要过关。`netcheck` 覆盖：
@@ -57,17 +57,17 @@ macOS 下 `netcheck` 会自动读取系统代理（`scutil --proxy`，如 Clash 
 ## 快速开始
 
 ```bash
-git clone https://github.com/ehomekevin/claude-env-cleanup.git
-cd claude-env-cleanup
+git clone https://github.com/ehomekevin/claude-neverbanned-skills.git
+cd claude-neverbanned-skills
 # 1. 只读扫描
-node scripts/claude_env_cleanup.cjs scan
+node scripts/claude_neverbanned_skills.cjs scan
 
 # 2. 完全退出 Claude Desktop（macOS ⌘Q / Windows 任务栏退出）和所有终端里的 claude 后，执行清理
-node scripts/claude_env_cleanup.cjs clean --yes
+node scripts/claude_neverbanned_skills.cjs clean --yes
 
 # 3. 处理备份目录：移动到 U 盘，或直接删除
 # 4. 需要时还原（备份还在的话）
-node scripts/claude_env_cleanup.cjs restore --from ~/.claude-env-cleanup-backups/<时间戳>
+node scripts/claude_neverbanned_skills.cjs restore --from ~/.claude-neverbanned-skills-backups/<时间戳>
 ```
 
 可选参数：`--json`（结构化输出）、`--keychain`（同时删 CLI 登录凭据）、`--keychain-desktop`（同时删 Desktop 加密密钥）、`--keep-relay`（保留 settings 中的中转变量）。
@@ -89,7 +89,7 @@ node scripts/claude_env_cleanup.cjs restore --from ~/.claude-env-cleanup-backups
 
 ```bash
 # 方式 A：社区标准 CLI（Node 22.20+，自动识别已安装的 Agent；-g 全局，-y 跳过确认）
-npx skills add ehomekevin/claude-env-cleanup --skill claude-env-cleanup -a claude-code -g
+npx skills add ehomekevin/claude-neverbanned-skills --skill claude-neverbanned-skills -a claude-code -g
 
 # 方式 B：本仓零依赖安装脚本（Node 18+，macOS / Linux / Windows）
 node scripts/install.cjs --list                      # 查看各 Agent 的安装路径

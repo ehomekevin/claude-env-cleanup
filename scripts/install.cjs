@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /*
- * claude-env-cleanup installer — 把本 skill 安装到主流 Agent 的 skills 目录。
+ * claude-neverbanned-skills installer — 把本 skill 安装到主流 Agent 的 skills 目录。
  *
  * 零依赖，Node 18+，支持 macOS / Linux / Windows。
  * 默认用符号链接（git pull 后自动生效）；--copy 复制一份；Windows 无权限建链接时自动回退复制。
@@ -25,7 +25,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const SKILL_NAME = "claude-env-cleanup";
+const SKILL_NAME = "claude-neverbanned-skills";
 const SOURCE_DIR = path.resolve(__dirname, "..");
 
 // 路径依据 Agent Skills 规范与社区维护的 agent→path 表（2026-11）：
@@ -85,7 +85,7 @@ function isOurs(target) {
 function backupExisting(target) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   // 放到 skills 目录之外，避免 Agent 把备份当成第二个同名 skill
-  const dir = path.join(path.dirname(path.dirname(target)), "claude-env-cleanup-backups");
+  const dir = path.join(path.dirname(path.dirname(target)), "claude-neverbanned-skills-backups");
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const bak = path.join(dir, `${SKILL_NAME}.bak-${stamp}`);
   fs.renameSync(target, bak);

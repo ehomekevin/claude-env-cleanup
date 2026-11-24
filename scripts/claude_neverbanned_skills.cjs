@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /*
- * claude-env-cleanup — Claude Desktop / Claude Code 本地环境残留扫描与清理（macOS / Windows）
+ * claude-neverbanned-skills — Claude Desktop / Claude Code 本地环境残留扫描与清理（macOS / Windows）
  *
  * 提炼自 NeverBanned 的 detectClaudeLocalResidue / resetClaudeLocalState，独立运行，零依赖。
  *
  * 用法：
- *   node claude_env_cleanup.cjs scan [--json]                     只读扫描（默认）
- *   node claude_env_cleanup.cjs netcheck [--json]                 清理后的网络环境只读检测（IP/DNS/WebRTC/Cloudflare/IPv6/时区语言对齐）
- *   node claude_env_cleanup.cjs clean --yes [--keychain] [--keychain-desktop] [--keep-relay] [--json]
- *   node claude_env_cleanup.cjs restore --from <备份目录> [--force] [--json]
+ *   node claude_neverbanned_skills.cjs scan [--json]                     只读扫描（默认）
+ *   node claude_neverbanned_skills.cjs netcheck [--json]                 清理后的网络环境只读检测（IP/DNS/WebRTC/Cloudflare/IPv6/时区语言对齐）
+ *   node claude_neverbanned_skills.cjs clean --yes [--keychain] [--keychain-desktop] [--keep-relay] [--json]
+ *   node claude_neverbanned_skills.cjs restore --from <备份目录> [--force] [--json]
  *   通用：--home <dir>  指定 HOME（测试用；非真实 HOME 时自动跳过 Keychain/defaults）
  *
  * 安全约束：
@@ -120,7 +120,7 @@ function resolvePaths(homeOverride) {
     desktopDir,
     claudeJson: path.join(home, ".claude.json"),
     dotClaude: path.join(home, ".claude"),
-    backupRoot: path.join(home, ".claude-env-cleanup-backups"),
+    backupRoot: path.join(home, ".claude-neverbanned-skills-backups"),
   };
 }
 
@@ -247,7 +247,7 @@ function runningClaudeDarwin() {
     const cmd = m[2];
     if (/\/Claude\.app\/Contents\/MacOS\/Claude(\s|$)/.test(cmd)) hits.push({ pid: Number(m[1]), kind: "Claude Desktop" });
     else if (/(^|\/)claude(\s|$)/.test(cmd.split(" ")[0]) || /@anthropic-ai\/claude-code/.test(cmd) || /\/\.local\/share\/claude\/versions\//.test(cmd)) {
-      if (!/claude_env_cleanup/.test(cmd)) hits.push({ pid: Number(m[1]), kind: "Claude Code CLI" });
+      if (!/claude_neverbanned_skills/.test(cmd)) hits.push({ pid: Number(m[1]), kind: "Claude Code CLI" });
     }
   }
   return hits;
@@ -913,7 +913,7 @@ function clean(P, flags) {
 // ---------------------------------------------------------------- restore
 
 function restore(P, from, flags) {
-  if (!from) throw new Error("restore 需要 --from <备份目录>（位于 ~/.claude-env-cleanup-backups/ 下）");
+  if (!from) throw new Error("restore 需要 --from <备份目录>（位于 ~/.claude-neverbanned-skills-backups/ 下）");
   const src = path.resolve(from);
   if (!isRealDir(src)) throw new Error(`备份目录不存在: ${src}`);
   const force = flags.has("--force");
